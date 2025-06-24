@@ -17,6 +17,8 @@
   "dependencies": {
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.1",
-    "openai": "^4.97.0"
+    "lru-cache": "^10.4.3",
+    "openai": "^4.97.0",
+    "rate-limiter-flexible": "^7.1.1"
   }
 }

@@ -1,394 +1,198 @@
-const {Client, GatewayIntentBits, Partials, ActivityType} = require('discord.js');
-const {OpenAI} = require('openai');
-
 require('dotenv').config();
+const { Client, GatewayIntentBits, Partials, ActivityType } = require('discord.js');
+const { OpenAI } = require('openai');
+const { LRUCache } = require('lru-cache');
 
-// noinspection JSUnresolvedReference
+// Constants
+const MAX_MESSAGE_LENGTH = 3000;
+const ERROR_MESSAGE = "❗ OnionBot failed to translate. Please try again.";
+const LENGTH_WARNING_MESSAGE = "⚠️ The message is too long. Please keep it under 3000 characters.";
+const SYSTEM_PROMPT = process.env.GPT_PROMPT;
+const NOT_TRANSLATABLE_KEYWORD = "not translatable";
+
+// Loading animation frames
+const LOADING_FRAMES = [
+  "🧅 Translating ░░░░░░░░░░",
+  "🧅 Translating ▓░░░░░░░░░",
+  "🧅 Translating ▓▓░░░░░░░░",
+  "🧅 Translating ▓▓▓░░░░░░░",
+  "🧅 Translating ▓▓▓▓░░░░░░",
+  "🧅 Translating ▓▓▓▓▓░░░░░",
+  "🧅 Translating ▓▓▓▓▓▓░░░░",
+  "🧅 Translating ▓▓▓▓▓▓▓░░░",
+  "🧅 Translating ▓▓▓▓▓▓▓▓░░",
+  "🧅 Translating ▓▓▓▓▓▓▓▓▓░",
+  "🧅 Translating ▓▓▓▓▓▓▓▓▓▓"
+];
+const LOADING_INTERVAL_MS = 500;
+const MAX_LOADING_DURATION_MS = 10000;
+
+// Initialize Discord client
 const discordClient = new Client({
-    partials: [Partials.Channel, Partials.Message],
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.MessageContent,
-              GatewayIntentBits.GuildMessages]
+  partials: [Partials.Channel, Partials.Message],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMessages
+  ]
 });
 
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
-const GPT_MODEL = process.env.GPT_MODEL ?? "gpt-4.1";
-const GPT_PROMPT = process.env.GPT_PROMPT ?? "You are a helpful assistant. Respond briefly, but informatively."
+// Initialize OpenAI client
+const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-let GPT_DEFAULT_SYSTEM_ROLE;
-{
-    const no_developer_messages = [
-        'o1-mini',
-        'o1-preview',
-    ];
-    const force_developer_models = [
-        'o1',
-        'o3',
-        'o4',
-    ];
-
-    let is_system_is_developer = false;
-    let is_no_developer = false;
-    let lowered = GPT_MODEL.toLowerCase();
-
-    for (let prefix of no_developer_messages) {
-        if ((lowered === prefix) || lowered.startsWith(prefix + '-')) {
-            is_no_developer = true;
-            break;
-        }
-    }
-
-    if (!is_no_developer) {
-        for (let prefix of force_developer_models) {
-            if ((lowered === prefix) || lowered.startsWith(prefix + '-')) {
-                is_system_is_developer = true;
-                break;
-            }
-        }
-    }
-
-    if (is_no_developer) {
-        GPT_DEFAULT_SYSTEM_ROLE = 'user';
-    } else if (is_system_is_developer) {
-        GPT_DEFAULT_SYSTEM_ROLE = 'developer';
-    } else {
-        GPT_DEFAULT_SYSTEM_ROLE = 'system';
-    }
-}
-
-let GPT_DEFAULT_NO_CHAT_COMPLETION_API = false;
-{
-    const no_chat_completion_api_prefixes = [
-        'o1-pro',
-    ];
-    let lowered = GPT_MODEL.toLowerCase();
-    for (let prefix of no_chat_completion_api_prefixes) {
-        if ((lowered === prefix) || lowered.startsWith(prefix + '-')) {
-            GPT_DEFAULT_NO_CHAT_COMPLETION_API = true;
-            break;
-        }
-    }
-}
-
-const GPT_SYSTEM_ROLE = process.env.GPT_SYSTEM_ROLE ?? GPT_DEFAULT_SYSTEM_ROLE;
-const GPT_NO_CHAT_COMPLETION_API = process.env.GPT_NO_CHAT_COMPLETION_API ?? GPT_DEFAULT_NO_CHAT_COMPLETION_API;
-
-const openaiClient = new OpenAI({
-    apiKey: OPENAI_API_KEY,
-});
-
-const usefulMessagesLifetime = 7 * 24 * 3600 * 1000;
-const unusefulMessagesLifetime = 24 * 3600 * 1000;
+// LRU cache for messages
+const messageCache = new LRUCache({ max: 1000, ttl: 1000 * 60 * 60 });
 
 let botName;
 const thisBotMessages = new Set();
-const allMessages = {};
-const usernames = {};
-let needShutdown = false;
-let currentProcessingMessaged = 0;
+const processedMessages = new Set();
+const originalToReplyMap = new Map();
 
+function isTranslatableText(text) {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (/^[\p{Emoji_Presentation}\p{Punctuation}\s]+$/u.test(trimmed)) return false;
+  if (/^\d+$/.test(trimmed)) return false;
+  return true;
+}
+
+// On ready event
 discordClient.on('ready', () => {
-    console.log(`Logged in`);
-    console.log(`Bot ID: ${discordClient.user.id}`);
-    console.log(`Startup Time: ${new Date().toLocaleString()}`);
-    console.log(`Serving on ${discordClient.guilds.cache.size} servers`);
-    console.log(`Observing ${discordClient.users.cache.size} users`);
-    botName = discordClient.user.username;
-
-    let statusText = `${GPT_MODEL}. ${GPT_PROMPT}`;
-    if (statusText.length > 50) {
-        statusText = statusText.substring(0, 50);
-    }
-
-    // https://discord.com/developers/docs/topics/gateway-events#activity-object-activity-structure
-    // You could see available types in gateway.d.ts
-    // noinspection JSCheckFunctionSignatures,JSUnresolvedReference
-    discordClient.user.setPresence({
-        status: 'online',
-        activities: [{
-            name: statusText,
-            type: ActivityType.Custom,
-            // details: "...details...", // GPT_PROMPT
-            // state: "...state...",
-            timestamps: {
-                start: Date.now(),
-            }
-        }],
-    });
+  botName = discordClient.user.username;
+  console.log(`OnionBot logged in as ${botName}`);
+  discordClient.user.setPresence({
+    status: 'online',
+    activities: [{ name: `OnionBot is online`, type: ActivityType.Custom, timestamps: { start: Date.now() } }],
+  });
 });
 
-discordClient.on('messageCreate', async (/** @type {Message} */ message) => {
-    if (needShutdown) {
-        return;
+const messageQueue = [];
+let isProcessingQueue = false;
+
+function enqueueMessage(message) {
+  if (message.author.bot) return;
+  messageQueue.push(message);
+  if (!isProcessingQueue) processQueue();
+}
+
+async function processQueue() {
+  isProcessingQueue = true;
+  while (messageQueue.length > 0) {
+    const nextMessage = messageQueue.shift();
+    await handleMessage(nextMessage);
+  }
+  isProcessingQueue = false;
+}
+
+discordClient.on('messageCreate', message => enqueueMessage(message));
+
+discordClient.on('messageUpdate', (oldMessage, newMessage) => {
+  const message = newMessage.partial ? oldMessage : newMessage;
+  if (!message || message.partial || !message.content || message.author?.bot) return;
+  enqueueMessage(message);
+});
+
+async function handleMessage(message) {
+  if (message.author.bot) return;
+
+  const hasReply = originalToReplyMap.has(message.id);
+  const wasProcessed = processedMessages.has(message.id);
+  if (wasProcessed && !hasReply) return;
+  if (!wasProcessed) processedMessages.add(message.id);
+
+  if (message.content.length >= MAX_MESSAGE_LENGTH) {
+    await message.reply(LENGTH_WARNING_MESSAGE);
+    return;
+  }
+  if (!isTranslatableText(message.content)) return;
+
+  // Update cache on new or edited
+  messageCache.set(message.id, { text: message.content, reference: message.reference?.messageId, author: message.author.username });
+
+  let loadingMessage;
+  let loadingInterval;
+  let loadingTimeout;
+  try {
+    // Send initial loading message and start animation
+    loadingMessage = await message.reply(LOADING_FRAMES[0]);
+    let frameIndex = 1;
+    loadingInterval = setInterval(() => {
+      if (!loadingMessage.editable) return;
+      loadingMessage.edit(LOADING_FRAMES[frameIndex % LOADING_FRAMES.length]);
+      frameIndex++;
+    }, LOADING_INTERVAL_MS);
+    // Ensure animation stops after max duration
+    loadingTimeout = setTimeout(() => clearInterval(loadingInterval), MAX_LOADING_DURATION_MS);
+
+    const response = await generateResponse(message.id, message.channelId);
+    clearInterval(loadingInterval);
+    clearTimeout(loadingTimeout);
+
+    if (!response || response.toLowerCase().includes(NOT_TRANSLATABLE_KEYWORD)) {
+      // Remove loading message if response not needed
+      await loadingMessage.delete().catch(() => null);
+      return;
     }
 
-    usernames[message.author.id] = message.author.username;
-    allMessages[message.id] = {
-        id: message.id,
-        referenceMessageId: message.reference?.messageId ?? null,
-        time: message.createdTimestamp,
-        authorName: message.author.username,
-        text: message.content,
-    };
-
-    if (message.author.bot) {
-        // Author is a bot itself
-        if (message.author.id === discordClient.user.id) {
-            thisBotMessages.add(message.id);
-        }
-
+    if (hasReply) {
+      const existing = await message.channel.messages.fetch(originalToReplyMap.get(message.id)).catch(() => null);
+      if (existing) {
+        await existing.edit(response);
+        // Delete loading message
+        await loadingMessage.delete().catch(() => null);
         return;
+      }
     }
 
-    const hasMentionMe = message.mentions.users.has(discordClient.user.id);
-    const answerToMe = ((message.reference !== null) && thisBotMessages.has(message.reference.messageId));
-    if (!hasMentionMe && !answerToMe) {
-        // I can't answer to this message
+    // Edit loading message to response
+    await loadingMessage.edit(response);
+    thisBotMessages.add(loadingMessage.id);
+    originalToReplyMap.set(message.id, loadingMessage.id);
+  } catch (err) {
+    clearInterval(loadingInterval);
+    clearTimeout(loadingTimeout);
+    console.error(`Error processing message ${message.id}:`, err);
+    if (hasReply) {
+      const existing = await message.channel.messages.fetch(originalToReplyMap.get(message.id)).catch(() => null);
+      if (existing) {
+        await existing.edit(ERROR_MESSAGE);
+        // Delete loading message
+        await loadingMessage.delete().catch(() => null);
         return;
+      }
     }
-
-    console.log('At ', new Date(message.createdTimestamp), '. Message from user ', message.author.displayName,
-        '. Text: ', message.content)
-    currentProcessingMessaged++;
-    const response = await generateResponse(message.id, message.channelId, OPENAI_API_KEY);
-    // const newMessage = await message.channel.send(response);
-    if (response.length <= 1950) {
-        const newMessage = await message.reply(response);
-        thisBotMessages.add(newMessage.id);
+    // On error, edit loading to error or send new
+    if (loadingMessage) {
+      await loadingMessage.edit(ERROR_MESSAGE);
     } else {
-        let responseLeft = response;
-        let prevMessage = message;
-        while (responseLeft !== '') {
-            const s = responseLeft.substring(0, 1950);
-            const newMessage = await prevMessage.reply(s);
-            thisBotMessages.add(newMessage.id);
-            responseLeft = responseLeft.substring(1950);
-            prevMessage = newMessage;
-        }
+      await message.reply(ERROR_MESSAGE);
     }
-
-    currentProcessingMessaged--;
-});
+  }
+}
 
 async function generateResponse(messageId, channelId) {
-    try {
-        if (!GPT_NO_CHAT_COMPLETION_API) {
-            return await generateResponse_chat(messageId, channelId);
-        }
+  const dialog = [];
+  let lastChainId = messageId;
+  const channel = await discordClient.channels.fetch(channelId);
 
-        return `Chat completion API is disabled for model ${GPT_MODEL}`;
-    } catch (error) {
-        console.error('Error generating response:', error.response ? error.response.data : error);
-        if (error.error) {
-            return `Sorry, I am unable to generate a response at this time ${error.error.type}: ${error.error.message}`;
-        } else {
-            return `Sorry, I am unable to generate a response at this time. ${error}`;
-        }
+  while (true) {
+    if (!messageCache.has(lastChainId)) {
+      const msg = await channel.messages.fetch(lastChainId).catch(() => null);
+      if (!msg) break;
+      messageCache.set(lastChainId, { text: msg.content, reference: msg.reference?.messageId, author: msg.author.username });
     }
+    const cached = messageCache.get(lastChainId);
+    dialog.push({ role: thisBotMessages.has(lastChainId) ? 'assistant' : 'user', content: cached.text, name: cached.author });
+    if (!cached.reference) break;
+    lastChainId = cached.reference;
+  }
+
+  dialog.reverse();
+  dialog.push({ role: 'system', content: SYSTEM_PROMPT });
+
+  const res = await openaiClient.chat.completions.create({ model: process.env.GPT_MODEL || 'gpt-4', messages: dialog, max_tokens: 4096, n: 1 });
+  return res.choices[0].message.content;
 }
 
-async function generateResponse_chat(messageId, channelId) {
-    const dialog = [];
-    let lastChainId = messageId;
-    const channel = await discordClient.channels.fetch(channelId);
-    while (true) {
-        if (!allMessages.hasOwnProperty(lastChainId)) {
-            // no parent message loaded
-            const message1 = await channel.messages.fetch(lastChainId).catch(() => null);
-            if (!message1) {
-                // Can't get this message. Break the cycle
-                break;
-            }
-
-            usernames[message1.author.id] = message1.author.username;
-            allMessages[lastChainId] = {
-                id: message1.id,
-                referenceMessageId: message1.reference?.messageId ?? null,
-                time: message1.createdTimestamp,
-                authorName: message1.author.username,
-                text: message1.content,
-            };
-        }
-
-        const message = allMessages[lastChainId];
-        if (thisBotMessages.has(lastChainId)) {
-            // This is THIS bot message
-            dialog.push({
-                role: "assistant",
-                content: message.text,
-                name: botName,
-            });
-        } else {
-            // This is a user message
-            dialog.push({
-                role: "user",
-                content: message.text,
-                name: message.authorName,
-            });
-        }
-
-        if (message.referenceMessageId === null) {
-            // No parent message. It's the root message for this branch
-            break;
-        }
-
-        lastChainId = message.referenceMessageId;
-    }
-
-    // Processing dialog
-    for (let i = 0; i < dialog.length; i++) {
-        const messageItem = dialog[i];
-        const message = messageItem.content;
-        const fixedMessage = fixMessageAppeals(message);
-        if (message === fixedMessage) {
-            continue;
-        }
-
-        messageItem.content = fixedMessage;
-        dialog[i] = messageItem;
-    }
-
-    dialog.push({role: GPT_SYSTEM_ROLE, content: [{type: "text", text: GPT_PROMPT}]});
-
-    /** https://platform.openai.com/docs/guides/text?api-mode=chat */
-    /** https://platform.openai.com/docs/api-reference/chat/create */
-    const response = await openaiClient.chat.completions.create({
-        model: GPT_MODEL,
-        messages: [...dialog].reverse(),
-        max_completion_tokens: 4096,
-        n: 1
-    });
-
-    console.log('OpenAI response. Model', response.model, '. Text: ', response.choices[0].message.content);
-    return response.choices[0].message.content;
-}
-
-function fixMessageAppeals(msg) {
-    const m = msg.match(/^<@(\d+)>/);
-    if (!m) {
-        return msg;
-    }
-
-    const id = m[1];
-    let rest = msg.slice(m[0].length).trimStart();
-
-    if (id === discordClient.user.id) {
-        return rest;
-    }
-
-    if (usernames[id]) {
-        rest = rest.replace(/^[ ,]+/, '').trimStart();
-        return `${usernames[id]}, ${rest}`;
-    }
-
-    return msg;
-}
-
-/**
- * Prints memory usage every hour indefinitely.
- *
- * @async
- * @return {void}
- */
-async function infiniteDrawMemoryUsage() {
-    await new Promise(resolve => setTimeout(resolve, 10 * 600 * 1000));
-    // noinspection InfiniteLoopJS
-    while (true) {
-        console.log('Memory usage');
-        const used = process.memoryUsage();
-        for (let key in used) {
-            console.log(`${key}\t${Math.round(used[key] * (100 / 1024 / 1024)) / 100} MB`);
-        }
-        await new Promise(resolve => setTimeout(resolve, 3600000));
-    }
-}
-
-async function infiniteCleanMessages() {
-    // noinspection InfiniteLoopJS
-    while (true) {
-        await new Promise(resolve => setTimeout(resolve, 3600000));
-        // await new Promise(resolve => setTimeout(resolve, 1000));
-        const prevMessagesCount = Object.keys(allMessages).length;
-        if (Object.keys(allMessages).length === 0) {
-            continue;
-        }
-
-        const usefulMessages = new Set();
-        for (const messageId of [...thisBotMessages].reverse()) {
-            let lastChainId = messageId;
-            while (true) {
-                if (usefulMessages.has(lastChainId)) {
-                    // already processed
-                    break;
-                }
-
-                if (!allMessages.hasOwnProperty(lastChainId)) {
-                    // already deleted from allMessages
-                    thisBotMessages.delete(lastChainId);
-                    break;
-                }
-
-                usefulMessages.add(lastChainId);
-                const message = allMessages[lastChainId];
-                if (message.referenceMessageId === null) {
-                    break;
-                }
-
-                lastChainId = message.referenceMessageId;
-            }
-        }
-
-        const now = Date.now();
-        const forDeletion = [];
-        for (const messageId in allMessages) {
-            const message = allMessages[messageId];
-            const isUseful = usefulMessages.has(messageId);
-            const lifetime = isUseful ? usefulMessagesLifetime : unusefulMessagesLifetime;
-
-            if (message.time + lifetime < now) {
-                forDeletion.push(messageId);
-            }
-        }
-
-        for (const messageId of forDeletion) {
-            delete allMessages[messageId];
-        }
-
-        console.log(`${prevMessagesCount - Object.keys(allMessages).length} messages deleted`);
-    }
-}
-
-// noinspection JSIgnoredPromiseFromCall
-infiniteDrawMemoryUsage();
-// noinspection JSIgnoredPromiseFromCall
-infiniteCleanMessages();
-
-process.on('SIGINT', async function() {
-    if (needShutdown) {
-        return;
-    }
-
-    console.log("Gracefully shutting down from SIGINT (Ctrl+C)");
-    needShutdown = true;
-    while (currentProcessingMessaged > 0) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
-
-    process.exit(0);
-});
-
-process.on('SIGTERM', async function() {
-    if (needShutdown) {
-        return;
-    }
-
-    console.log("Gracefully shutting down from SIGTERM");
-    needShutdown = true;
-    while (currentProcessingMessaged > 0) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-    }
-
-    process.exit(0);
-});
-
-discordClient.login(DISCORD_BOT_TOKEN).then();
+discordClient.login(process.env.DISCORD_BOT_TOKEN);
